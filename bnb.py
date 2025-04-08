@@ -36,7 +36,7 @@ from ortools.linear_solver import pywraplp
 from pysat.examples.rc2 import RC2
 from pysat.formula import WCNF
 
-from helpers import is_conflict
+from linear_programming import get_linear_program
 
 rec_num = 0
 
@@ -762,6 +762,9 @@ class LinearProgrammingBounding(BoundingAlgAbstract):
             na_value: Value representing missing data in the matrix
         """
         self.matrix = None  # Input Matrix
+        # Linear Program solver and variables
+        self.linear_program = None
+        self.linear_program_vars = None
         self._extra_info = None  # Additional information from bounding
         self._extraInfo = {}  # For compatibility with the abstract class
         self._times = {}  # Store timing information
@@ -803,58 +806,9 @@ class LinearProgrammingBounding(BoundingAlgAbstract):
         # Start timing model preparation
         model_time_start = time.time()
 
-        # Create solver
-        solver = pywraplp.Solver.CreateSolver("GLOP")
-
-        # Get dimensions
-        m = self.matrix.shape[0]  # rows
-        n = self.matrix.shape[1]  # cols
-
-        # Create variables
-        vars = {}
-        for i in range(m):
-            for j in range(n):
-                vars[f"x_{i}_{j}"] = solver.NumVar(
-                    float(self.matrix[i, j]), 1, f"x_{i}_{j}"
-                )
-
-        for p in range(n):
-            for q in range(p + 1, n):
-                vars[f"B_{p}_{q}_1_0"] = solver.NumVar(0, 1, f"B_{p}_{q}_1_0")
-                vars[f"B_{p}_{q}_0_1"] = solver.NumVar(0, 1, f"B_{p}_{q}_0_1")
-                vars[f"B_{p}_{q}_1_1"] = solver.NumVar(0, 1, f"B_{p}_{q}_1_1")
-
-        # Create constraints
-        for p in range(n):
-            for q in range(p + 1, n):
-                solver.Add(
-                    vars[f"B_{p}_{q}_1_0"]
-                    + vars[f"B_{p}_{q}_0_1"]
-                    + vars[f"B_{p}_{q}_1_1"]
-                    <= 2
-                )
-
-                for i in range(m):
-                    solver.Add(
-                        vars[f"x_{i}_{p}"] - vars[f"x_{i}_{q}"]
-                        <= vars[f"B_{p}_{q}_1_0"]
-                    )
-                    solver.Add(
-                        -vars[f"x_{i}_{p}"] + vars[f"x_{i}_{q}"]
-                        <= vars[f"B_{p}_{q}_0_1"]
-                    )
-                    solver.Add(
-                        vars[f"x_{i}_{p}"] + vars[f"x_{i}_{q}"]
-                        <= 1 + vars[f"B_{p}_{q}_1_1"]
-                    )
-
-        # Define objective function
-        objective = solver.Objective()
-        for i in range(m):
-            for j in range(n):
-                if self.matrix[i, j] == 0:  # only count flips of 0→1
-                    objective.SetCoefficient(vars[f"x_{i}_{j}"], 1)
-        objective.SetMinimization()
+        solver, objective, vars = get_linear_program(self.matrix)
+        self.linear_program = solver
+        self.linear_program_vars = vars
 
         # Record model preparation time
         model_time = time.time() - model_time_start
@@ -871,10 +825,16 @@ class LinearProgrammingBounding(BoundingAlgAbstract):
             return None
 
         # Round solution to get a binary matrix
+        m = self.matrix.shape[0]  # rows
+        n = self.matrix.shape[1]  # cols
         solution = np.copy(self.matrix)
+        # TODO: Optimize `get_linear_program()` to not return `vars`, which are used below
         for i in range(m):
             for j in range(n):
-                if self.matrix[i, j] == 0 and vars[f"x_{i}_{j}"].solution_value() > 0.5:
+                if (
+                    self.matrix[i, j] == 0
+                    and vars[f"x_{i}_{j}"].solution_value() >= 0.5
+                ):
                     solution[i, j] = 1
 
         # Check if the solution is conflict-free
@@ -922,65 +882,12 @@ class LinearProgrammingBounding(BoundingAlgAbstract):
         model_time_start = time.time()
 
         # Create solver
-        solver = pywraplp.Solver.CreateSolver("GLOP")
-
-        # Get dimensions
-        m = current_matrix.shape[0]  # rows
-        n = current_matrix.shape[1]  # cols
-
-        # Create variables
-        vars = {}
-        for p in range(n):
-            for q in range(p + 1, n):
-                if is_conflict(current_matrix, p, q):  # Check cols # TODO: CHANGE
-                    vars[f"B_{p}_{q}_1_0"] = solver.NumVar(
-                        0, 1, f"B_{p}_{q}_1_0"
-                    )  # (6)
-                    vars[f"B_{p}_{q}_0_1"] = solver.NumVar(
-                        0, 1, f"B_{p}_{q}_0_1"
-                    )  # (6)
-                    vars[f"B_{p}_{q}_1_1"] = solver.NumVar(
-                        0, 1, f"B_{p}_{q}_1_1"
-                    )  # (6)
-
-        for i in range(m):
-            for j in range(n):
-                vars[f"x_{i}_{j}"] = solver.NumVar(
-                    float(current_matrix[i, j]), 1, f"x_{i}_{j}"
-                )  # (7)
-
-        # Create constraints
-        for p in range(n):
-            for q in range(p + 1, n):
-                if is_conflict(current_matrix, p, q):  # Check cols # TODO: CHANGE
-                    solver.Add(
-                        vars[f"B_{p}_{q}_1_0"]
-                        + vars[f"B_{p}_{q}_0_1"]
-                        + vars[f"B_{p}_{q}_1_1"]
-                        <= 2
-                    )  # (5)
-
-                    for i in range(m):
-                        solver.Add(
-                            vars[f"x_{i}_{p}"] - vars[f"x_{i}_{q}"]
-                            <= vars[f"B_{p}_{q}_1_0"]
-                        )  # (2)
-                        solver.Add(
-                            -vars[f"x_{i}_{p}"] + vars[f"x_{i}_{q}"]
-                            <= vars[f"B_{p}_{q}_0_1"]
-                        )  # (3)
-                        solver.Add(
-                            vars[f"x_{i}_{p}"] + vars[f"x_{i}_{q}"]
-                            <= 1 + vars[f"B_{p}_{q}_1_1"]
-                        )  # (4)
-
-        # Define objective function
-        objective = solver.Objective()
-        for i in range(m):
-            for j in range(n):
-                if current_matrix[i, j] == 0:  # only count flips of 0→1
-                    objective.SetCoefficient(vars[f"x_{i}_{j}"], 1)  # (1)
-        objective.SetMinimization()
+        # Instead of getting a brand new linear_program, just update the existing one.
+        ## TODO: Switch to linear program recycler get_linear_program_from_delta
+        solver, objective, vars = get_linear_program(current_matrix)
+        # solver, objective = get_linear_program_from_delta(
+        #     self.linear_program, self.linear_program_vars, delta
+        # )
 
         # Record model preparation time
         model_time = time.time() - model_time_start
@@ -1217,11 +1124,10 @@ class BnB(pybnb.Problem):
                         nodecol_pair = extra_info["one_pair_of_columns"]
                 if node_icf is None:
                     x = get_effective_matrix(self.I, nodedelta, node_na_delta)
-                    (
-                        node_icf,
-                        nodecol_pair,
-                    ) = is_conflict_free_gusfield_and_get_two_columns_in_coflicts(
-                        x, self.na_value
+                    node_icf, nodecol_pair = (
+                        is_conflict_free_gusfield_and_get_two_columns_in_coflicts(
+                            x, self.na_value
+                        )
                     )
 
                 node_bound_value = max(self.bound_value, new_bound)
@@ -1247,7 +1153,7 @@ class BnB(pybnb.Problem):
 
 def bnb_solve(matrix, bounding_algorithm, na_value=None):
     problem1 = BnB(matrix, bounding_algorithm, na_value=na_value)
-    solver = pybnb.solver.Solver()
+    solver = pybnb.Solver()
     results1 = solver.solve(problem1, queue_strategy="custom", log=None)
     if results1.solution_status != "unknown":
         returned_delta = results1.best_node.state[0]
@@ -1259,4 +1165,3 @@ def bnb_solve(matrix, bounding_algorithm, na_value=None):
         returned_matrix = np.zeros((1, 1))
     # print("results1.nodes:  ", results1.nodes)
     return returned_matrix, results1.termination_condition
-
